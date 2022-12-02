@@ -1,0 +1,322 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+
+my $os = $^O;
+die "This only supports Linux for now.\n" unless $os eq 'linux';
+
+my $uid = $<;
+die "This must be run as root.\n" unless 0 == $uid;
+
+my $repo_package_basename = 'puppet7-release';
+
+my @post_run_files = (
+  './pupdate-post/generic',
+);
+
+my %distros_supported_by_puppet_7 = (
+# per https://puppet.com/docs/puppet/7.5/system_requirements.html
+
+  'amazon'     => [ '1', '2' ],
+  'debian'     => [ 'stretch', 'buster' ],
+  'ubuntu'     => [ 'xenial', 'bionic', 'focal' ],
+  'el'         => [ '6', '7', '8' ],
+  'centos'     => [ '6', '7', '8' ],
+	'cloudlinux' => [ '6', '7', '8' ],
+	'fedora'     => [ '30', '31', '32' ],
+  'oracle'     => [ '6', '7', '8' ],
+  'sles'       => [ '11', '12', '15' ],
+);
+
+my %version_map = (
+  'amazon' => { '1' => '6', '2' => '7', },
+  'debian' => { '9' => 'stretch', '10' => 'buster', '11' => 'bullseye' },
+  'ubuntu' => { '16.04' => 'xenial', '18.04' => 'bionic', '20.04' => 'focal'},
+);
+
+my @release_files = (
+  '/etc/os-release',
+  '/etc/lsb-release',
+);
+
+my %distro_families = (
+  'redhat' => {
+    'repository'  => 'https://yum.puppet.com/',
+    'pkg_type'    => 'noarch.rpm',
+    'pkg_repo'    => sub { sprintf '/usr/bin/rpm -Uvh %s', $_[0]; },
+    'pkg_install' => sub { sprintf '/usr/bin/yum install -y %s', $_[0]; },
+    'pkg_remove'  => sub { sprintf '/usr/bin/yum erase -y %s', $_[0]; },
+    'family_test' => sub { return -e '/etc/redhat-release' },
+		'distro_info' => sub { fallback_parser( 'redhat', '/etc/redhat-release' ) },
+    'members'     => {
+      # These sometimes don't match the whole version, but we only need the major version for our purposes.
+			'amazon'     => qr{Amazon Linux AMI release (\d+)$},
+      'rhel'       => qr{Red Hat(?: Enterprise)? Linux(?: Server)? release (\d+)},
+      'centos'     => qr{^CentOS(?: Linux)? release (\d+)},
+      'cloudlinux' => qr{CloudLinux Server release (\d+)},
+      'oracle'     => qr{Enterprise Linux Server release (\d+)},
+			'scientific' => qr{^Scientific Linux release (\d+)},
+			'sles'       => qr{VERSION = (\d+)},
+    },
+  },
+  'debian' => {
+    'repository'  => 'https://apt.puppetlabs.com/',
+    'pkg_type'    => 'deb',
+    'pkg_repo'    => sub { sprintf 'apt install wget ; /usr/bin/wget %s ; dpkg -i %s.deb ; apt update', $_[0], $_[1] },
+    'pkg_install' => sub { sprintf 'apt install -y %s', $_[0]; },
+    'pkg_remove'  => sub { sprintf 'apt remove -y %s', $_[0]; },
+    'family_test' => sub { return -e '/etc/debian_version' },
+	  'distro_info' => sub { fallback_parser( 'debian', '/etc/apt/sources.list', '/etc/debian_version' ) },
+    'members'     => {
+			'debian' => qr{(?:deb\s+\S+/debian/?\s+([[:alpha:]]+)(?:\s+.*)?$|(?:^([[:alpha:]])/[[:alpha:]]$))},
+			'ubuntu' => qr{(?:deb\s+\S+/ubuntu/?\s+([[:alpha:]]+)(?:\s+.*)?$|(?:^([[:alpha:]])/[[:alpha:]]$))},
+		},
+	},
+);
+
+sub os_info {
+  my ( $family, $name, $version );
+
+  for my $rf ( @release_files ) {
+    if ( -e $rf ) {
+      ( $family, $name, $version ) = release_file( $rf );
+      last if defined $version;
+    }
+  }
+
+	if ( ! defined $family ) {
+	  for my $fam ( keys %distro_families ) {
+  	  if ( $distro_families{$fam}{'family_test'}->() ) {
+				$family = $fam;
+				last;
+      }
+	  }
+		return undef unless defined $family;
+
+		( $name, $version ) = $distro_families{$family}{'distro_info'}->();
+		return undef unless defined $version;
+	}
+
+  return wantarray() ? ( $family, $name, $version ) : $name;
+}
+
+sub release_file {
+  my $rf = shift;
+  my ( $f, $n, $v );
+
+    if ( open my $in, '<', $rf ) {
+      while ( <$in> ) {
+        if ( /^ID="([^[^"]+)"$/ ) {
+          $n = lc $1;
+        } elsif ( /^VERSION="[\.[:digit:]]+ LTS, (\S+) \S+$/ ) {
+          $v = $1;
+        } elsif ( m{^PRETTY_NAME="Debian GNU/Linux ([^/+])/\S+$} ) {
+          $v = $1;
+        } elsif ( m{^PRETTY_NAME="Debian GNU/Linux \(([^/+])\)$} ) {
+          $v = $1;
+        } elsif ( /^VERSION_ID="(\d+)[^"]*?"$/ ) {
+          $v = $1;
+        }
+      }
+
+      for my $fam ( keys %distro_families ) {
+        if ( exists $distro_families{$fam}{'members'}{$n} ) {
+          $f = $fam;
+          last;
+        }
+      }
+
+      # I'm not sure when this would be the case, but just in case...
+      if ( $n eq 'debian' || $n eq 'ubuntu' ) {
+        if ( $v =~ /\d/ ) {
+          $v = $version_map{ $n }{ $v };
+        }
+      }
+
+    } else {
+      warn "Found release file $rf but cannot read it.: $!\n";
+    }
+
+  return undef unless ( defined $f && defined $n && defined $v );
+  warn "Using OS data from release file '$rf'.\n";
+  return ( $f, $n, $v );
+}
+
+sub fallback_parser {
+  my $family = shift;
+  my @version_files = @_;
+  my ( $name, $version );
+
+  my %members = %{ $distro_families{$family}{'members'} };
+
+  for my $vf ( @version_files ) {
+    if ( open my $in, '<', $vf ) {
+      while ( <$in> ) {
+        for my $mem ( keys %members ) {
+          if ( $_ =~ $members{$mem} ) {
+            ( $name, $version ) = ( $mem, $1 );
+            warn "Using OS data from fallback family-specific file '$vf'.\n";
+            last if defined $version;
+          }
+        }
+      }
+    } else {
+      warn "Cannot read from $vf even though we should be able to: $!\n";
+    }
+  }
+
+  return undef unless defined $version;
+  return ( $name, $version );
+}
+
+sub repo_package_name {
+  my ( $distro, $version ) = @_;
+  my ( $uses_distro, $uses_version );
+
+  if ( $version_map{$distro}{$version} ) {
+    $uses_version = $version_map{$distro}{$version};
+  } else {
+    $uses_version = $version;
+  }
+
+  if ( $distro eq 'sles' ) {
+    $uses_distro = 'sles';
+  } elsif ( exists $distro_families{'redhat'}{'members'}{$distro} ) {
+    $uses_distro = 'el';
+  } elsif ( exists $distro_families{'debian'}{'members'}{$distro} ) {
+    $uses_distro = '';
+  } else {
+    $uses_distro = '';
+  }
+
+  my $package_name = $repo_package_basename . '-' . ( $uses_distro ? join '-', $uses_distro, $uses_version : $uses_version  );
+  return $package_name;
+}
+
+sub repo_package_url {
+  my ( $family, $package ) = @_;
+
+  my $package_url = sprintf(
+    '%s%s.%s',
+    $distro_families{$family}{'repository'},
+    $package,
+    $distro_families{$family}{'pkg_type'}
+  );
+
+  return $package_url;
+}
+
+sub install_new_puppet {
+  my ( $distro_family, $distro_name, $version ) = @_;
+  my $package = repo_package_name( $distro_name, $version );
+  my $url = repo_package_url( $distro_family, $package );
+
+  my $release_cmd = $distro_families{$distro_family}{'pkg_repo'}->( $url, $package );
+  my $agent_cmd = $distro_families{$distro_family}{'pkg_install'}->( 'puppet-agent' );
+
+  warn "Trying to install puppet release package with command '$release_cmd'...\n";
+  ( 0 == system $release_cmd ) or ( warn "Failed to install puppet7 release package!\n" && exit 1 );
+  warn "Trying to install puppet-agent with command '$agent_cmd'...\n";
+  ( 0 == system $agent_cmd ) or ( warn "Failed to install puppet-agent!\n" && exit 2 );
+
+  return;
+}
+
+sub remove_old_puppet {
+  my ( $family, undef, undef ) = @_;
+
+  warn "Getting ready to back up old Puppet files and remove old Puppet packages...\n";
+  ( system '/usr/bin/mkdir', '/root/puppet-backup' ) && die "Failed to create /root/puppet-backup\n";
+
+  my @commands = (
+    $distro_families{$family}{'pkg_remove'}->( 'puppet' ),
+    $distro_families{$family}{'pkg_remove'}->( 'puppet-agent' ),
+    $distro_families{$family}{'pkg_remove'}->( 'facter' ),
+    $distro_families{$family}{'pkg_remove'}->( 'puppet-release' ),
+    $distro_families{$family}{'pkg_remove'}->( 'puppet6-release' ),
+    $distro_families{$family}{'pkg_remove'}->( 'puppet7-release' ),
+    sprintf '/bin/mv %s /root/puppet-backup/var-lib-puppet', '/var/lib/puppet',
+    sprintf '/bin/mv %s /root/puppet-backup/etc-puppet', '/etc/puppet',
+    sprintf '/bin/mv %s /root/puppet-backup/etc-sysconfig-puppet', '/etc/sysconfig/puppet',
+    sprintf '/bin/mv %s /root/puppet-backup/etc-puppetlabs-puppet-ssl', '/etc/puppetlabs/puppet/ssl',
+  );
+
+  warn "Trying to clean up old Puppet files...\n";
+  for my $cmd ( @commands ) {
+    if ( 0 == system $cmd ) {
+      warn "success: '$cmd'\n";
+    } else {
+      # warn "failure: '$cmd'\n";
+    }
+  }
+
+  return;
+}
+
+sub supported_distro_version {
+  my ( $distro_family, $distro_name, $version ) = @_;
+
+  return grep { $version == $_ } @{ $distros_supported_by_puppet_7{$distro_name} };
+}
+
+sub run_post {
+  my ( $distro_family, $distro_name, $version ) = @_;
+  my @post_files = @post_run_files;
+
+  push(
+    @post_files,
+    "./pupdate-post/${distro_family}",
+    "./pupdate-post/${distro_name}",
+    "./pupdate-post/${distro_name}-${version}",
+  );
+
+  warn "List of possible post-run commands to execute, if they are found and are executable:\n";
+  warn join( ', ', @post_files ) . "\n";
+
+  foreach my $pf ( @post_files ) {
+    if ( -f $pf ) {
+      if ( -x $pf ) {
+        if ( 0 == system $pf ) {
+          warn "Successfully ran post-run command $pf\n";
+        } else {
+          warn "There was an error running post-run command $pf\n";
+        }
+      } else {
+        warn "Found post-run command $pf but it is not executable.\n";
+      }
+    }
+  }
+  warn "No other post-run executables were found.\n";
+  return;
+}
+
+
+####
+##### main
+####
+
+my ( $distro_family, $distro_name, $version ) = my @os = os_info();
+
+
+if ( ! supported_distro_version( @os ) ) {
+  warn "You appear to be running on a platform unsupported by Puppet or this program "
+    . "(as of when this program was last updated).";
+
+  warn "Currently supported versions are:\n";
+
+  my $string;
+  for my $d ( keys %distros_supported_by_puppet_7 ) {
+    $string .= sprintf "\t%s: %s\n", $d, ( join ', ', @{ $distros_supported_by_puppet_7{$d} } );
+  }
+  $string .= "\n\nIf you think this is error, please submit a pull request or contact a maintainer.\n\n";
+
+  warn $string;
+  exit 3;
+}
+
+remove_old_puppet( @os );
+install_new_puppet( @os );
+run_post( @os );
+exit;
+
+
